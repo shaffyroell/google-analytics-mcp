@@ -57,6 +57,9 @@ from analytics_mcp.tools.utils import _credentials_ctx
 # request, so oauthlib will reject redirect URIs as "insecure" even though
 # they are HTTPS at the edge. This flag disables that transport check.
 os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
+# Google returns full scope URIs (e.g. https://...userinfo.email) even when
+# shorthand aliases (email, profile) were requested. Relax the scope check.
+os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
 
 logger = logging.getLogger(__name__)
 
@@ -64,10 +67,10 @@ logger = logging.getLogger(__name__)
 # Google OAuth scopes
 # ---------------------------------------------------------------------------
 _SCOPES = [
-    "https://www.googleapis.com/auth/analytics.readonly",
     "openid",
-    "email",
-    "profile",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/userinfo.profile",
+    "https://www.googleapis.com/auth/analytics.readonly",
 ]
 
 # ---------------------------------------------------------------------------
