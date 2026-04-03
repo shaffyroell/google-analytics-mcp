@@ -333,20 +333,15 @@ def create_app() -> Starlette:
         client_id = str(__import__("uuid").uuid4())
         issued_at = int(time.time())
 
-        try:
-            redirect_uris = [AnyHttpUrl(u) for u in redirect_uris_raw]
-        except Exception:
-            return JSONResponse(
-                {"error": "invalid_client_metadata",
-                 "error_description": "Invalid redirect_uri"},
-                status_code=400,
-            )
-
+        # Pass redirect_uris as plain strings so Pydantic converts them to
+        # AnyUrl (the field type on OAuthClientInformationFull). Using AnyHttpUrl
+        # here would cause AnyHttpUrl != AnyUrl comparisons to fail silently in
+        # validate_redirect_uri() even when the URL strings are identical.
         client_info = OAuthClientInformationFull(
             client_id=client_id,
             client_secret=client_secret,
             client_id_issued_at=issued_at,
-            redirect_uris=redirect_uris,
+            redirect_uris=redirect_uris_raw,  # plain strings → Pydantic → AnyUrl
             token_endpoint_auth_method=auth_method,
             grant_types=grant_types,
             response_types=body.get("response_types", ["code"]),
