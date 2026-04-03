@@ -38,10 +38,10 @@ import logging
 import os
 import secrets
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import httpx
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
@@ -402,40 +402,57 @@ def create_app() -> FastAPI:
 
     # ------------------------------------------------------------------
     # MCP endpoint (Streamable HTTP transport)
+    #
+    # Mounted as a raw ASGI app — NOT a FastAPI route — so that the
+    # session manager writes directly to the ASGI send callable without
+    # FastAPI's request_response wrapper trying to send a second response
+    # on top of it (which would corrupt the stream).
     # ------------------------------------------------------------------
 
-    @app.api_route("/mcp", methods=["GET", "POST", "DELETE"])
-    async def handle_mcp(request: Request, token: Optional[str] = Query(default=None)):
-        session_id = request.headers.get("mcp-session-id")
+    class _MCPAuthApp:
+        """Raw ASGI app: auth gate → session_manager."""
 
-        if not session_id:
-            # New session — must authenticate.
-            resolved = token
-            if not resolved:
-                auth_header = request.headers.get("authorization", "")
-                if auth_header.startswith("Bearer "):
-                    resolved = auth_header[7:]
+        async def __call__(self, scope, receive, send):
+            if scope["type"] != "http":
+                return
 
-            if not resolved or resolved not in _token_store:
-                base = _base_url(request)
-                return Response(
-                    status_code=401,
-                    headers={
-                        "WWW-Authenticate": f'Bearer realm="{_SCOPE_FINGERPRINT}"',
-                    },
-                )
+            headers = dict(scope.get("headers", []))
+            session_id = headers.get(b"mcp-session-id")
 
-            # Set credentials in this task's context so they are copied to
-            # the server task that the session manager spawns.
-            creds = _creds_from_store(_token_store[resolved]["credentials"])
-            ctx_token = _credentials_ctx.set(creds)
-            try:
-                await session_manager.handle_request(request.scope, request.receive, request._send)
-            finally:
-                _credentials_ctx.reset(ctx_token)
-        else:
-            # Existing session — credentials already live in the server task.
-            await session_manager.handle_request(request.scope, request.receive, request._send)
+            if not session_id:
+                # New session — authenticate first.
+                token = None
+
+                # Check Authorization header
+                auth = headers.get(b"authorization", b"").decode()
+                if auth.startswith("Bearer "):
+                    token = auth[7:]
+
+                # Also accept ?token=... query param
+                if not token:
+                    from urllib.parse import parse_qs
+                    qs = scope.get("query_string", b"").decode()
+                    token = parse_qs(qs).get("token", [None])[0]
+
+                if not token or token not in _token_store:
+                    response = Response(
+                        status_code=401,
+                        headers={"WWW-Authenticate": f'Bearer realm="{_SCOPE_FINGERPRINT}"'},
+                    )
+                    await response(scope, receive, send)
+                    return
+
+                creds = _creds_from_store(_token_store[token]["credentials"])
+                ctx_token = _credentials_ctx.set(creds)
+                try:
+                    await session_manager.handle_request(scope, receive, send)
+                finally:
+                    _credentials_ctx.reset(ctx_token)
+            else:
+                # Existing session — credentials live in the spawned server task.
+                await session_manager.handle_request(scope, receive, send)
+
+    app.mount("/mcp", _MCPAuthApp())
 
     return app
 
