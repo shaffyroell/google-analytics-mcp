@@ -1,0 +1,3 @@
+# Generated for Railway/Railpack — installs the package with web extras.
+# The canonical dependency list lives in pyproject.toml.
+-e ".[web]"
