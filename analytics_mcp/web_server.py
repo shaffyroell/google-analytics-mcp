@@ -14,9 +14,10 @@
 
 """HTTP-based MCP server with OAuth 2.0 authorization for cloud deployment.
 
-Implements the MCP Authorization spec so Claude.ai can authenticate
-automatically. Uses the Streamable HTTP transport (mcp>=1.6) which is
-what modern MCP clients including Claude.ai expect.
+Uses the MCP SDK's built-in auth infrastructure (mcp.server.auth.*) so the
+OAuth endpoints are spec-correct and compatible with Claude.ai's MCP connector.
+Google OAuth is used as the identity provider — we act as an OAuth AS that
+proxies authentication to Google.
 
 Setup
 -----
@@ -38,15 +39,30 @@ import logging
 import os
 import secrets
 import time
-from typing import Any, Dict
+from typing import Any
 
 import httpx
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
+from mcp.server.auth.provider import (
+    AccessToken,
+    AuthorizationCode,
+    AuthorizationParams,
+    OAuthAuthorizationServerProvider,
+    TokenError,
+)
+from mcp.server.auth.routes import create_auth_routes
+from mcp.server.auth.settings import ClientRegistrationOptions
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
+from pydantic import AnyHttpUrl
+from starlette.applications import Starlette
+from starlette.middleware import Middleware
 from starlette.middleware.sessions import SessionMiddleware
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from starlette.routing import Mount, Route
+from starlette.types import Receive, Scope, Send
 
 import analytics_mcp.coordinator as coordinator
 from analytics_mcp.tools.utils import _credentials_ctx
@@ -63,15 +79,8 @@ _SCOPES = [
     "https://www.googleapis.com/auth/analytics.readonly",
 ]
 
-# ---------------------------------------------------------------------------
-# In-memory stores
-# ---------------------------------------------------------------------------
-_token_store: Dict[str, Dict[str, Any]] = {}   # bearer_token -> {credentials, email}
-_auth_codes: Dict[str, Dict[str, Any]] = {}    # auth_code   -> {credentials, …, expires_at}
-_pending_auths: Dict[str, Dict[str, Any]] = {} # oauth_session_id -> {client params, …}
-
-# Scope fingerprint — stable 12-char hex used as OAuth realm and ETag on
-# well-known responses, matching the pattern from google_workspace_mcp.
+# 12-char hex fingerprint of sorted scopes — used as Bearer realm value and
+# ETag on well-known responses (matches google_workspace_mcp pattern).
 _SCOPE_FINGERPRINT: str = hashlib.sha256(
     " ".join(sorted(_SCOPES)).encode()
 ).hexdigest()[:12]
@@ -88,7 +97,7 @@ def _require_env(name: str) -> str:
     return v
 
 
-def _base_url(request: Request) -> str:
+def _get_base_url(request: Request) -> str:
     explicit = os.environ.get("BASE_URL", "").rstrip("/")
     if explicit:
         return explicit
@@ -121,9 +130,14 @@ def _creds_from_store(data: dict) -> Credentials:
     )
 
 
-def _verify_pkce(challenge: str, verifier: str) -> bool:
-    digest = hashlib.sha256(verifier.encode()).digest()
-    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode() == challenge
+async def _fetch_email(access_token: str) -> str:
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            "https://www.googleapis.com/oauth2/v2/userinfo",
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=10,
+        )
+    return (resp.json() if resp.is_success else {}).get("email", "unknown")
 
 
 _PAGE = """\
@@ -142,13 +156,116 @@ def _page(body: str) -> HTMLResponse:
 
 
 # ---------------------------------------------------------------------------
+# OAuth provider — proxies identity to Google
+# ---------------------------------------------------------------------------
+
+class GoogleOAuthProvider(OAuthAuthorizationServerProvider):
+    """MCP OAuth AS that proxies authentication to Google OAuth 2.0."""
+
+    def __init__(self) -> None:
+        # Registered MCP clients (dynamic registration)
+        self._clients: dict[str, OAuthClientInformationFull] = {}
+        # MCP auth codes issued after Google callback
+        self._auth_codes: dict[str, AuthorizationCode] = {}
+        # Google credentials associated with each MCP auth code
+        self._auth_code_creds: dict[str, dict] = {}
+        # Issued bearer tokens → credentials + metadata
+        self._tokens: dict[str, dict[str, Any]] = {}
+        # Pending Google OAuth flows keyed by google_state
+        self._pending: dict[str, dict[str, Any]] = {}
+
+    async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
+        return self._clients.get(client_id)
+
+    async def register_client(self, client_info: OAuthClientInformationFull) -> None:
+        self._clients[client_info.client_id] = client_info
+
+    async def authorize(
+        self, client: OAuthClientInformationFull, params: AuthorizationParams
+    ) -> str:
+        """Start Google OAuth flow and return the Google authorization URL."""
+        base_url = os.environ.get("BASE_URL", "").rstrip("/")
+        if not base_url:
+            raise RuntimeError("BASE_URL env var is required for MCP OAuth")
+
+        google_state = secrets.token_urlsafe(16)
+        callback_uri = f"{base_url}/auth/callback"
+        flow = _make_flow(callback_uri)
+        auth_url, _ = flow.authorization_url(
+            access_type="offline",
+            prompt="consent",
+            state=google_state,
+        )
+        self._pending[google_state] = {
+            "params": params,
+            "client": client,
+            "code_verifier": getattr(flow, "code_verifier", None),
+            "callback_uri": callback_uri,
+        }
+        return auth_url
+
+    async def load_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: str
+    ) -> AuthorizationCode | None:
+        return self._auth_codes.get(authorization_code)
+
+    async def exchange_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
+    ) -> OAuthToken:
+        creds_data = self._auth_code_creds.pop(authorization_code.code, None)
+        if creds_data is None:
+            raise TokenError(error="invalid_grant", error_description="Credentials not found")
+
+        del self._auth_codes[authorization_code.code]
+
+        bearer = secrets.token_urlsafe(32)
+        self._tokens[bearer] = {
+            "credentials": creds_data["credentials"],
+            "email": creds_data["email"],
+            "client_id": client.client_id,
+            "scopes": authorization_code.scopes,
+            "expires_at": int(time.time()) + 3600,
+        }
+        return OAuthToken(
+            access_token=bearer,
+            token_type="Bearer",
+            expires_in=3600,
+            scope=" ".join(authorization_code.scopes),
+        )
+
+    async def load_refresh_token(self, client: OAuthClientInformationFull, refresh_token: str):
+        return None  # Refresh tokens not supported
+
+    async def exchange_refresh_token(self, client, refresh_token, scopes):
+        raise TokenError(error="unsupported_grant_type")
+
+    async def load_access_token(self, token: str) -> AccessToken | None:
+        entry = self._tokens.get(token)
+        if not entry:
+            return None
+        if time.time() > entry["expires_at"]:
+            return None
+        return AccessToken(
+            token=token,
+            client_id=entry["client_id"],
+            scopes=entry["scopes"],
+            expires_at=entry["expires_at"],
+        )
+
+    async def revoke_token(self, token: AccessToken) -> None:
+        self._tokens.pop(token.token, None)
+
+
+# ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
 
-def create_app() -> FastAPI:
+def create_app() -> Starlette:
     secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
+    base_url = os.environ.get("BASE_URL", "").rstrip("/")
 
-    # Session manager runs for the lifetime of the app.
+    provider = GoogleOAuthProvider()
+
     session_manager = StreamableHTTPSessionManager(
         app=coordinator.app,
         json_response=False,
@@ -156,26 +273,26 @@ def create_app() -> FastAPI:
         session_idle_timeout=1800,
     )
 
-    @contextlib.asynccontextmanager
-    async def lifespan(_app: FastAPI):
-        async with session_manager.run():
-            yield
-
-    app = FastAPI(title="Google Analytics MCP Server", lifespan=lifespan)
-    app.add_middleware(SessionMiddleware, secret_key=secret_key, max_age=86400, https_only=False)
-
     # ------------------------------------------------------------------
-    # Health
+    # SDK OAuth routes — handles /.well-known/oauth-authorization-server,
+    # /register, /authorize, /token correctly per spec.
     # ------------------------------------------------------------------
 
-    @app.get("/health")
-    async def health():
-        return {"status": "ok"}
+    # issuer_url must be a valid AnyHttpUrl; fall back to a placeholder if
+    # BASE_URL isn't set yet (it will be set in the Railway environment).
+    issuer = base_url or "https://placeholder.invalid"
+    auth_routes = create_auth_routes(
+        provider=provider,
+        issuer_url=AnyHttpUrl(issuer),
+        client_registration_options=ClientRegistrationOptions(
+            enabled=True,
+            valid_scopes=_SCOPES,
+            default_scopes=_SCOPES,
+        ),
+    )
 
     # ------------------------------------------------------------------
-    # OAuth 2.0 Protected Resource Metadata  (RFC 9728)
-    # Claude.ai resolves this first from the WWW-Authenticate header, then
-    # follows authorization_servers to find the authorization server.
+    # Protected Resource Metadata (RFC 9728)
     # ------------------------------------------------------------------
 
     _wk_headers = {
@@ -183,131 +300,31 @@ def create_app() -> FastAPI:
         "ETag": f'"{_SCOPE_FINGERPRINT}"',
     }
 
-    @app.get("/.well-known/oauth-protected-resource")
-    async def protected_resource_metadata(request: Request):
-        base = _base_url(request)
+    async def protected_resource_metadata(request: Request) -> JSONResponse:
+        base = _get_base_url(request)
         return JSONResponse(
-            {
-                "resource": base,
-                "authorization_servers": [base],
-                "scopes_supported": _SCOPES,
-            },
+            {"resource": base, "authorization_servers": [base], "scopes_supported": _SCOPES},
             headers=_wk_headers,
         )
 
     # ------------------------------------------------------------------
-    # OAuth 2.0 Authorization Server Metadata  (MCP spec / RFC 8414)
+    # Google OAuth callback — shared by MCP flow and browser login
     # ------------------------------------------------------------------
 
-    @app.get("/.well-known/oauth-authorization-server")
-    async def oauth_metadata(request: Request):
-        base = _base_url(request)
-        return JSONResponse(
-            {
-                "issuer": base,
-                "authorization_endpoint": f"{base}/authorize",
-                "token_endpoint": f"{base}/token",
-                "registration_endpoint": f"{base}/register",
-                "response_types_supported": ["code"],
-                "grant_types_supported": ["authorization_code"],
-                "code_challenge_methods_supported": ["S256"],
-                "token_endpoint_auth_methods_supported": ["none"],
-                "scopes_supported": _SCOPES,
-            },
-            headers=_wk_headers,
-        )
+    async def auth_callback(request: Request) -> Response:
+        code = request.query_params.get("code", "")
+        state = request.query_params.get("state", "")
+        error = request.query_params.get("error", "")
 
-    # ------------------------------------------------------------------
-    # Dynamic Client Registration  (RFC 7591)
-    # ------------------------------------------------------------------
-
-    @app.post("/register")
-    async def register_client():
-        return JSONResponse({
-            "client_id": secrets.token_urlsafe(16),
-            "client_id_issued_at": int(time.time()),
-            "token_endpoint_auth_method": "none",
-            "grant_types": ["authorization_code"],
-            "response_types": ["code"],
-        }, status_code=201)
-
-    # ------------------------------------------------------------------
-    # Authorization endpoint — proxies to Google OAuth
-    # ------------------------------------------------------------------
-
-    @app.get("/authorize")
-    async def authorize(
-        request: Request,
-        client_id: str = "",
-        redirect_uri: str = "",
-        state: str = "",
-        scope: str = "",
-        code_challenge: str = "",
-        code_challenge_method: str = "S256",
-        response_type: str = "code",
-    ):
-        session_id = secrets.token_urlsafe(16)
-        callback_uri = f"{_base_url(request)}/auth/callback"
-        flow = _make_flow(callback_uri)
-        auth_url, _ = flow.authorization_url(
-            access_type="offline",
-            prompt="consent",
-            state=session_id,
-        )
-        _pending_auths[session_id] = {
-            "client_redirect_uri": redirect_uri,
-            "client_state": state,
-            "code_challenge": code_challenge,
-            "code_challenge_method": code_challenge_method,
-            "callback_uri": callback_uri,
-            "google_code_verifier": getattr(flow, "code_verifier", None),
-        }
-        return RedirectResponse(auth_url)
-
-    # ------------------------------------------------------------------
-    # Token endpoint
-    # ------------------------------------------------------------------
-
-    @app.post("/token")
-    async def token_endpoint(request: Request):
-        form = await request.form()
-        if form.get("grant_type") != "authorization_code":
-            return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
-
-        entry = _auth_codes.pop(str(form.get("code", "")), None)
-        if not entry:
-            return JSONResponse({"error": "invalid_grant"}, status_code=400)
-        if time.time() > entry["expires_at"]:
-            return JSONResponse({"error": "invalid_grant", "error_description": "Code expired"}, status_code=400)
-
-        if entry.get("code_challenge"):
-            verifier = str(form.get("code_verifier", ""))
-            if not verifier or not _verify_pkce(entry["code_challenge"], verifier):
-                return JSONResponse({"error": "invalid_grant", "error_description": "PKCE failed"}, status_code=400)
-
-        bearer = secrets.token_urlsafe(32)
-        _token_store[bearer] = {"credentials": entry["credentials"], "email": entry["email"]}
-        return JSONResponse({
-            "access_token": bearer,
-            "token_type": "bearer",
-            "expires_in": 3600,
-            "scope": " ".join(_SCOPES),
-        })
-
-    # ------------------------------------------------------------------
-    # Google OAuth callback (shared by browser login and /authorize flow)
-    # ------------------------------------------------------------------
-
-    @app.get("/auth/callback")
-    async def auth_callback(request: Request, code: str = "", state: str = "", error: str = ""):
         if error:
             return _page(f"<h1>Sign-in failed</h1><p>{html.escape(error)}</p><p><a href='/'>Try again</a></p>")
 
-        is_mcp = state in _pending_auths
+        is_mcp = state in provider._pending
+
         if is_mcp:
-            pending = _pending_auths.pop(state)
+            pending = provider._pending.pop(state)
             callback_uri = pending["callback_uri"]
-            code_verifier = pending.get("google_code_verifier")
+            code_verifier = pending.get("code_verifier")
         else:
             stored = request.session.pop("oauth_state", None)
             if state != stored:
@@ -325,13 +342,7 @@ def create_app() -> FastAPI:
             return _page(f"<h1>Sign-in failed</h1><pre>{html.escape(str(exc))}</pre><p><a href='/'>Try again</a></p>")
 
         creds = flow.credentials
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                "https://www.googleapis.com/oauth2/v2/userinfo",
-                headers={"Authorization": f"Bearer {creds.token}"},
-                timeout=10,
-            )
-        user_email = (resp.json() if resp.is_success else {}).get("email", "unknown")
+        user_email = await _fetch_email(creds.token)
 
         creds_data = {
             "token": creds.token,
@@ -343,76 +354,100 @@ def create_app() -> FastAPI:
         }
 
         if is_mcp:
-            auth_code = secrets.token_urlsafe(32)
-            _auth_codes[auth_code] = {
+            params: AuthorizationParams = pending["params"]
+            client: OAuthClientInformationFull = pending["client"]
+            mcp_code = secrets.token_urlsafe(32)
+
+            auth_code_obj = AuthorizationCode(
+                code=mcp_code,
+                scopes=params.scopes or _SCOPES,
+                expires_at=time.time() + 600,
+                client_id=client.client_id,
+                code_challenge=params.code_challenge,
+                redirect_uri=params.redirect_uri,
+                redirect_uri_provided_explicitly=params.redirect_uri_provided_explicitly,
+            )
+            provider._auth_codes[mcp_code] = auth_code_obj
+            provider._auth_code_creds[mcp_code] = {
                 "credentials": creds_data,
                 "email": user_email,
-                "code_challenge": pending.get("code_challenge", ""),
-                "code_challenge_method": pending.get("code_challenge_method", "S256"),
-                "expires_at": time.time() + 600,
             }
-            sep = "&" if "?" in pending["client_redirect_uri"] else "?"
+
+            redirect_uri_str = str(params.redirect_uri)
+            sep = "&" if "?" in redirect_uri_str else "?"
             return RedirectResponse(
-                f"{pending['client_redirect_uri']}{sep}code={auth_code}&state={pending['client_state']}"
+                f"{redirect_uri_str}{sep}code={mcp_code}&state={params.state or ''}",
+                status_code=302,
             )
         else:
             bearer = secrets.token_urlsafe(32)
-            _token_store[bearer] = {"credentials": creds_data, "email": user_email}
+            provider._tokens[bearer] = {
+                "credentials": creds_data,
+                "email": user_email,
+                "client_id": "browser",
+                "scopes": _SCOPES,
+                "expires_at": int(time.time()) + 86400,
+            }
             request.session["user_email"] = user_email
             request.session["bearer_token"] = bearer
-            return RedirectResponse("/")
+            return RedirectResponse("/", status_code=302)
 
     # ------------------------------------------------------------------
     # Browser login helpers
     # ------------------------------------------------------------------
 
-    @app.get("/auth/google")
-    async def auth_google(request: Request):
-        uri = f"{_base_url(request)}/auth/callback"
+    async def auth_google(request: Request) -> Response:
+        base = _get_base_url(request)
+        uri = f"{base}/auth/callback"
         flow = _make_flow(uri)
-        auth_url, state = flow.authorization_url(access_type="offline", include_granted_scopes="true", prompt="consent")
+        auth_url, state = flow.authorization_url(
+            access_type="offline", include_granted_scopes="true", prompt="consent"
+        )
         request.session["oauth_state"] = state
         request.session["redirect_uri"] = uri
         if getattr(flow, "code_verifier", None):
             request.session["code_verifier"] = flow.code_verifier
         return RedirectResponse(auth_url)
 
-    @app.get("/auth/logout")
-    async def auth_logout(request: Request):
-        _token_store.pop(request.session.get("bearer_token", ""), None)
+    async def auth_logout(request: Request) -> Response:
+        provider._tokens.pop(request.session.get("bearer_token", ""), None)
         request.session.clear()
         return RedirectResponse("/")
 
     # ------------------------------------------------------------------
-    # Landing page
+    # Landing page and health
     # ------------------------------------------------------------------
 
-    @app.get("/")
-    async def index(request: Request):
-        base = _base_url(request)
+    async def health(_request: Request) -> JSONResponse:
+        return JSONResponse({"status": "ok"})
+
+    async def index(request: Request) -> HTMLResponse:
+        base = _get_base_url(request)
         email = request.session.get("user_email")
-        body = f"""\
-<h1>Google Analytics MCP Server</h1>
-{"<p>Signed in as <strong>" + html.escape(email) + "</strong></p>" if email else ""}
-<span class="label">Add this URL to Claude.ai as a remote MCP server:</span>
-<pre>{html.escape(base)}/mcp</pre>
-<p>Claude.ai will open a sign-in popup automatically.</p>
-{"<p><a href='/auth/logout' style='color:#888;font-size:.9rem'>Sign out</a></p>" if email else f"<br><a href='/auth/google' class='btn'>Sign in with Google</a>"}"""
+        body = (
+            f"<h1>Google Analytics MCP Server</h1>"
+            + (f"<p>Signed in as <strong>{html.escape(email)}</strong></p>" if email else "")
+            + f'<span class="label">Add this URL to Claude.ai as a remote MCP server:</span>'
+            + f"<pre>{html.escape(base)}/mcp</pre>"
+            + "<p>Claude.ai will open a sign-in popup automatically.</p>"
+            + (
+                "<p><a href='/auth/logout' style='color:#888;font-size:.9rem'>Sign out</a></p>"
+                if email
+                else f"<br><a href='/auth/google' class='btn'>Sign in with Google</a>"
+            )
+        )
         return _page(body)
 
     # ------------------------------------------------------------------
-    # MCP endpoint (Streamable HTTP transport)
+    # MCP endpoint — raw ASGI app mounted at /mcp
     #
-    # Mounted as a raw ASGI app — NOT a FastAPI route — so that the
-    # session manager writes directly to the ASGI send callable without
-    # FastAPI's request_response wrapper trying to send a second response
-    # on top of it (which would corrupt the stream).
+    # Mounted as a plain ASGI callable (NOT a Starlette/FastAPI route) so
+    # that session_manager.handle_request() writes directly to the ASGI
+    # send callable with no response-wrapper interference.
     # ------------------------------------------------------------------
 
     class _MCPAuthApp:
-        """Raw ASGI app: auth gate → session_manager."""
-
-        async def __call__(self, scope, receive, send):
+        async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
             if scope["type"] != "http":
                 return
 
@@ -420,29 +455,32 @@ def create_app() -> FastAPI:
             session_id = headers.get(b"mcp-session-id")
 
             if not session_id:
-                # New session — authenticate first.
-                token = None
+                # New session — validate Bearer token first.
+                token: str | None = None
 
-                # Check Authorization header
                 auth = headers.get(b"authorization", b"").decode()
                 if auth.startswith("Bearer "):
                     token = auth[7:]
 
-                # Also accept ?token=... query param
                 if not token:
                     from urllib.parse import parse_qs
                     qs = scope.get("query_string", b"").decode()
-                    token = parse_qs(qs).get("token", [None])[0]
+                    token = (parse_qs(qs).get("token") or [None])[0]
 
-                if not token or token not in _token_store:
-                    response = Response(
+                # Validate via provider (checks existence and expiry).
+                access_token_obj = None
+                if token:
+                    access_token_obj = await provider.load_access_token(token)
+
+                if not access_token_obj or not token or token not in provider._tokens:
+                    resp = Response(
                         status_code=401,
                         headers={"WWW-Authenticate": f'Bearer realm="{_SCOPE_FINGERPRINT}"'},
                     )
-                    await response(scope, receive, send)
+                    await resp(scope, receive, send)
                     return
 
-                creds = _creds_from_store(_token_store[token]["credentials"])
+                creds = _creds_from_store(provider._tokens[token]["credentials"])
                 ctx_token = _credentials_ctx.set(creds)
                 try:
                     await session_manager.handle_request(scope, receive, send)
@@ -452,8 +490,38 @@ def create_app() -> FastAPI:
                 # Existing session — credentials live in the spawned server task.
                 await session_manager.handle_request(scope, receive, send)
 
-    app.mount("/mcp", _MCPAuthApp())
+    # ------------------------------------------------------------------
+    # Assemble Starlette app
+    # ------------------------------------------------------------------
 
+    routes = [
+        *auth_routes,  # /.well-known/oauth-authorization-server, /register, /authorize, /token
+        Route("/.well-known/oauth-protected-resource", protected_resource_metadata),
+        Route("/auth/callback", auth_callback),
+        Route("/auth/google", auth_google),
+        Route("/auth/logout", auth_logout),
+        Route("/health", health),
+        Route("/", index),
+        Mount("/mcp", app=_MCPAuthApp()),
+    ]
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_app):
+        async with session_manager.run():
+            yield
+
+    app = Starlette(
+        routes=routes,
+        middleware=[
+            Middleware(
+                SessionMiddleware,
+                secret_key=secret_key,
+                max_age=86400,
+                https_only=False,
+            )
+        ],
+        lifespan=lifespan,
+    )
     return app
 
 
@@ -461,7 +529,7 @@ def create_app() -> FastAPI:
 # Entry point
 # ---------------------------------------------------------------------------
 
-def run_web_server():
+def run_web_server() -> None:
     import uvicorn
     port = int(os.environ.get("PORT", 8080))
     uvicorn.run(create_app(), host="0.0.0.0", port=port, log_level="info")
