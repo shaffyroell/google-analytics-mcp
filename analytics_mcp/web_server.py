@@ -327,7 +327,7 @@ def create_app() -> Starlette:
                 status_code=400,
             )
 
-        auth_method: str = body.get("token_endpoint_auth_method") or "client_secret_post"
+        auth_method: str = body.get("token_endpoint_auth_method") or "none"
         client_secret = secrets.token_hex(32) if auth_method != "none" else None
 
         client_id = str(__import__("uuid").uuid4())
