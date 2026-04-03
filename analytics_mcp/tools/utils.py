@@ -14,6 +14,7 @@
 
 """Common utilities used by the MCP server."""
 
+from contextvars import ContextVar
 from typing import Any, Dict
 
 from google.analytics import admin_v1beta, data_v1beta, admin_v1alpha
@@ -21,6 +22,13 @@ from google.api_core.gapic_v1.client_info import ClientInfo
 from importlib import metadata
 import google.auth
 import proto
+
+# Per-request credentials context variable. When set, API clients use these
+# credentials instead of Application Default Credentials (used for web/OAuth
+# deployments where each user authenticates independently).
+_credentials_ctx: ContextVar[
+    google.auth.credentials.Credentials | None
+] = ContextVar("_credentials_ctx", default=None)
 
 
 def _get_package_version_with_fallback():
@@ -51,34 +59,39 @@ def _create_credentials() -> google.auth.credentials.Credentials:
     return credentials
 
 
-def create_admin_api_client() -> admin_v1beta.AnalyticsAdminServiceAsyncClient:
-    """Returns a properly configured Google Analytics Admin API async client.
+def _get_effective_credentials() -> google.auth.credentials.Credentials:
+    """Returns the effective credentials for the current request.
 
-    Uses Application Default Credentials with read-only scope.
+    Uses per-request credentials from the context variable when available
+    (e.g. user OAuth credentials in web deployments), otherwise falls back
+    to Application Default Credentials.
     """
+    creds = _credentials_ctx.get()
+    if creds is not None:
+        return creds
+    return _create_credentials()
+
+
+def create_admin_api_client() -> admin_v1beta.AnalyticsAdminServiceAsyncClient:
+    """Returns a properly configured Google Analytics Admin API async client."""
     return admin_v1beta.AnalyticsAdminServiceAsyncClient(
-        client_info=_CLIENT_INFO, credentials=_create_credentials()
+        client_info=_CLIENT_INFO, credentials=_get_effective_credentials()
     )
 
 
 def create_data_api_client() -> data_v1beta.BetaAnalyticsDataAsyncClient:
-    """Returns a properly configured Google Analytics Data API async client.
-
-    Uses Application Default Credentials with read-only scope.
-    """
+    """Returns a properly configured Google Analytics Data API async client."""
     return data_v1beta.BetaAnalyticsDataAsyncClient(
-        client_info=_CLIENT_INFO, credentials=_create_credentials()
+        client_info=_CLIENT_INFO, credentials=_get_effective_credentials()
     )
 
 
 def create_admin_alpha_api_client() -> (
     admin_v1alpha.AnalyticsAdminServiceAsyncClient
 ):
-    """Returns a properly configured Google Analytics Admin API (alpha) async client.
-    Uses Application Default Credentials with read-only scope.
-    """
+    """Returns a properly configured Google Analytics Admin API (alpha) async client."""
     return admin_v1alpha.AnalyticsAdminServiceAsyncClient(
-        client_info=_CLIENT_INFO, credentials=_create_credentials()
+        client_info=_CLIENT_INFO, credentials=_get_effective_credentials()
     )
 
 

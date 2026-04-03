@@ -44,9 +44,20 @@ issues = "https://github.com/googleanalytics/google-analytics-mcp/issues"
 analytics-mcp = "analytics_mcp.server:run_server"
 # The previous name of the script. Kept for backwards compatibility.
 google-analytics-mcp = "analytics_mcp.server:run_server"
+# Web / cloud deployment entry point (requires the 'web' optional dependencies).
+analytics-mcp-web = "analytics_mcp.web_server:run_web_server"
 
 [project.optional-dependencies]
 dev = ["black", "nox >=2026.2.9, <2027"]
+# Extra dependencies for cloud/web deployment (Railway, etc.).
+# Install with:  pip install ".[web]"
+web = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "google-auth-oauthlib>=1.2.0",
+    "itsdangerous>=2.2.0",
+    "starlette>=0.46.0",
+]
 
 [build-system]
 requires = ["setuptools>=82.0.0", "wheel"]
