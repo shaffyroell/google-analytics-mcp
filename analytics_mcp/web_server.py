@@ -601,7 +601,7 @@ def create_app() -> Starlette:
         Route("/auth/logout", auth_logout),
         Route("/health", health),
         Route("/", index),
-        Mount("/mcp", app=_MCPAuthApp()),
+        Route("/mcp", _MCPAuthApp()),
     ]
 
     @contextlib.asynccontextmanager
