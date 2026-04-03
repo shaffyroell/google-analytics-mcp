@@ -292,6 +292,82 @@ def create_app() -> Starlette:
     )
 
     # ------------------------------------------------------------------
+    # Custom /register — must come BEFORE auth_routes in the route list
+    # so it takes priority over the SDK's built-in handler.
+    #
+    # The SDK's handler (register.py:76) rejects registrations where
+    # grant_types doesn't include BOTH authorization_code AND refresh_token.
+    # Claude.ai registers with only ["authorization_code"] per the MCP spec
+    # for public clients, which causes the SDK to return 400 and Claude.ai
+    # shows "Authorization failed". We normalise grant_types here.
+    # ------------------------------------------------------------------
+
+    async def register_client(request: Request) -> JSONResponse:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid_client_metadata"}, status_code=400)
+
+        grant_types: list = body.get("grant_types", ["authorization_code", "refresh_token"])
+        # Add refresh_token so the SDK's /authorize + /token handlers are happy.
+        if "authorization_code" not in grant_types:
+            return JSONResponse(
+                {"error": "invalid_client_metadata",
+                 "error_description": "grant_types must include authorization_code"},
+                status_code=400,
+            )
+        if "refresh_token" not in grant_types:
+            grant_types = list(grant_types) + ["refresh_token"]
+
+        redirect_uris_raw: list = body.get("redirect_uris", [])
+        if not redirect_uris_raw:
+            return JSONResponse(
+                {"error": "invalid_client_metadata",
+                 "error_description": "redirect_uris is required"},
+                status_code=400,
+            )
+
+        auth_method: str = body.get("token_endpoint_auth_method") or "client_secret_post"
+        client_secret = secrets.token_hex(32) if auth_method != "none" else None
+
+        client_id = str(__import__("uuid").uuid4())
+        issued_at = int(time.time())
+
+        try:
+            redirect_uris = [AnyHttpUrl(u) for u in redirect_uris_raw]
+        except Exception:
+            return JSONResponse(
+                {"error": "invalid_client_metadata",
+                 "error_description": "Invalid redirect_uri"},
+                status_code=400,
+            )
+
+        client_info = OAuthClientInformationFull(
+            client_id=client_id,
+            client_secret=client_secret,
+            client_id_issued_at=issued_at,
+            redirect_uris=redirect_uris,
+            token_endpoint_auth_method=auth_method,
+            grant_types=grant_types,
+            response_types=body.get("response_types", ["code"]),
+            scope=" ".join(_SCOPES),
+        )
+        await provider.register_client(client_info)
+
+        resp_body: dict = {
+            "client_id": client_id,
+            "client_id_issued_at": issued_at,
+            "redirect_uris": redirect_uris_raw,
+            "grant_types": grant_types,
+            "response_types": ["code"],
+            "token_endpoint_auth_method": auth_method,
+            "scope": " ".join(_SCOPES),
+        }
+        if client_secret:
+            resp_body["client_secret"] = client_secret
+        return JSONResponse(resp_body, status_code=201)
+
+    # ------------------------------------------------------------------
     # Protected Resource Metadata (RFC 9728)
     # ------------------------------------------------------------------
 
@@ -495,7 +571,10 @@ def create_app() -> Starlette:
     # ------------------------------------------------------------------
 
     routes = [
-        *auth_routes,  # /.well-known/oauth-authorization-server, /register, /authorize, /token
+        # Custom /register MUST come before auth_routes so it takes priority
+        # over the SDK's built-in handler (which rejects Claude.ai's registration).
+        Route("/register", register_client, methods=["POST"]),
+        *auth_routes,  # /.well-known/oauth-authorization-server, /authorize, /token (and /register — shadowed above)
         Route("/.well-known/oauth-protected-resource", protected_resource_metadata),
         Route("/auth/callback", auth_callback),
         Route("/auth/google", auth_google),
