@@ -167,6 +167,20 @@ def create_app() -> FastAPI:
         return {"status": "ok"}
 
     # ------------------------------------------------------------------
+    # OAuth 2.0 Protected Resource Metadata  (RFC 9728)
+    # Claude.ai resolves this first from the WWW-Authenticate header, then
+    # follows authorization_servers to find the authorization server.
+    # ------------------------------------------------------------------
+
+    @app.get("/.well-known/oauth-protected-resource")
+    async def protected_resource_metadata(request: Request):
+        base = _base_url(request)
+        return JSONResponse({
+            "resource": base,
+            "authorization_servers": [base],
+        })
+
+    # ------------------------------------------------------------------
     # OAuth 2.0 Authorization Server Metadata  (MCP spec / RFC 8414)
     # ------------------------------------------------------------------
 
@@ -389,8 +403,7 @@ def create_app() -> FastAPI:
                     status_code=401,
                     headers={
                         "WWW-Authenticate": (
-                            f'Bearer realm="{base}",'
-                            f' resource_metadata="{base}/.well-known/oauth-authorization-server"'
+                            f'Bearer resource_metadata="{base}/.well-known/oauth-protected-resource"'
                         )
                     },
                 )
