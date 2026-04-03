@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""HTTP-based MCP server with Google OAuth for cloud deployment (e.g. Railway).
+"""HTTP-based MCP server with OAuth 2.0 authorization for cloud deployment.
+
+This server implements the MCP Authorization spec so that clients like
+Claude.ai can authenticate automatically via Google OAuth.
 
 Setup
 -----
@@ -32,17 +35,30 @@ Google Cloud Console setup
 1. Create an OAuth 2.0 Web Application client.
 2. Add  <BASE_URL>/auth/callback  as an authorised redirect URI.
 3. Enable the Google Analytics Admin API and Analytics Data API.
+
+How Claude.ai connects
+----------------------
+1. Claude.ai fetches /.well-known/oauth-authorization-server to discover endpoints.
+2. Claude.ai calls /register to register itself as a client.
+3. Claude.ai opens a browser for the user to sign in at /authorize.
+4. /authorize proxies through Google OAuth; on success redirects back to Claude.ai
+   with a short-lived auth code.
+5. Claude.ai calls /token to exchange the code for a bearer token.
+6. Claude.ai connects to /sse with Authorization: Bearer <token>.
 """
 
+import base64
+import hashlib
 import html
 import logging
 import os
 import secrets
+import time
 from typing import Any, Dict, Optional
 
 import httpx
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from mcp.server.lowlevel import NotificationOptions
@@ -53,12 +69,9 @@ from starlette.middleware.sessions import SessionMiddleware
 import analytics_mcp.coordinator as coordinator
 from analytics_mcp.tools.utils import _credentials_ctx
 
-# Railway (and most reverse proxies) terminate TLS before the app sees the
-# request, so oauthlib will reject redirect URIs as "insecure" even though
-# they are HTTPS at the edge. This flag disables that transport check.
+# Railway terminates TLS before the app sees the request.
 os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
-# Google returns full scope URIs (e.g. https://...userinfo.email) even when
-# shorthand aliases (email, profile) were requested. Relax the scope check.
+# Google returns full scope URIs even when shorthand aliases were requested.
 os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
 
 logger = logging.getLogger(__name__)
@@ -74,10 +87,18 @@ _SCOPES = [
 ]
 
 # ---------------------------------------------------------------------------
-# In-memory bearer-token store  { token -> {"credentials": {...}, "email": str} }
-# For a multi-instance deployment replace this with Redis / a database.
+# In-memory stores (replace with Redis for multi-instance deployments)
 # ---------------------------------------------------------------------------
+
+# Bearer tokens issued to MCP clients  {token -> {credentials, email}}
 _token_store: Dict[str, Dict[str, Any]] = {}
+
+# Short-lived auth codes issued after Google OAuth  {code -> {…, expires_at}}
+_auth_codes: Dict[str, Dict[str, Any]] = {}
+
+# Pending OAuth sessions initiated via /authorize
+# {oauth_session_id -> {client_redirect_uri, client_state, code_challenge, …}}
+_pending_auths: Dict[str, Dict[str, Any]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +116,6 @@ def _require_env(name: str) -> str:
 
 
 def _base_url(request: Request) -> str:
-    """Returns the public base URL, respecting Railway / reverse-proxy headers."""
     explicit = os.environ.get("BASE_URL", "").rstrip("/")
     if explicit:
         return explicit
@@ -143,8 +163,14 @@ def _mcp_init_options() -> InitializationOptions:
     )
 
 
+def _verify_pkce(code_challenge: str, code_verifier: str) -> bool:
+    digest = hashlib.sha256(code_verifier.encode()).digest()
+    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+    return challenge == code_challenge
+
+
 # ---------------------------------------------------------------------------
-# Page templates
+# Page template
 # ---------------------------------------------------------------------------
 
 _PAGE = """\
@@ -168,9 +194,7 @@ _PAGE = """\
     .label {{ font-weight: 600; margin-top: 1.2rem; display: block }}
   </style>
 </head>
-<body>
-{body}
-</body>
+<body>{body}</body>
 </html>"""
 
 
@@ -187,9 +211,6 @@ def create_app() -> FastAPI:
     secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
 
     app = FastAPI(title="Google Analytics MCP Server")
-
-    # Sessions are signed with SECRET_KEY. Use https_only=False so the cookie
-    # works on Railway even when the TLS is terminated upstream.
     app.add_middleware(
         SessionMiddleware,
         secret_key=secret_key,
@@ -200,7 +221,7 @@ def create_app() -> FastAPI:
     sse = SseServerTransport("/messages/")
 
     # ------------------------------------------------------------------
-    # Health check (used by Railway)
+    # Health check
     # ------------------------------------------------------------------
 
     @app.get("/health")
@@ -208,66 +229,148 @@ def create_app() -> FastAPI:
         return {"status": "ok"}
 
     # ------------------------------------------------------------------
-    # Landing page
+    # OAuth 2.0 Authorization Server Metadata (MCP spec requirement)
+    # Claude.ai reads this to discover our auth endpoints.
     # ------------------------------------------------------------------
 
-    @app.get("/")
-    async def index(request: Request):
-        user_email = request.session.get("user_email")
-        bearer_token = request.session.get("bearer_token")
-
-        if user_email and bearer_token:
-            base = _base_url(request)
-            sse_url = f"{base}/sse?token={bearer_token}"
-            safe_email = html.escape(user_email)
-            safe_token = html.escape(bearer_token)
-            safe_sse = html.escape(sse_url)
-            body = f"""\
-<h1>Google Analytics MCP Server</h1>
-<p>Signed in as <strong>{safe_email}</strong></p>
-
-<span class="label">MCP SSE endpoint (include in your client config)</span>
-<pre>{safe_sse}</pre>
-
-<span class="label">Or configure separately</span>
-<pre>SSE URL:      {html.escape(base)}/sse
-Bearer token: {safe_token}</pre>
-
-<p><a href="/auth/logout" class="logout">Sign out</a></p>"""
-        else:
-            body = """\
-<h1>Google Analytics MCP Server</h1>
-<p>Sign in with your Google account to get an MCP access token
-for your Google Analytics data.</p>
-<br>
-<a href="/auth/google" class="btn">Sign in with Google</a>"""
-
-        return _page(body)
+    @app.get("/.well-known/oauth-authorization-server")
+    async def oauth_metadata(request: Request):
+        base = _base_url(request)
+        return JSONResponse({
+            "issuer": base,
+            "authorization_endpoint": f"{base}/authorize",
+            "token_endpoint": f"{base}/token",
+            "registration_endpoint": f"{base}/register",
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code"],
+            "code_challenge_methods_supported": ["S256"],
+            "token_endpoint_auth_methods_supported": ["none"],
+        })
 
     # ------------------------------------------------------------------
-    # OAuth: start
+    # Dynamic Client Registration (MCP spec requirement)
+    # Claude.ai registers itself here before starting the auth flow.
     # ------------------------------------------------------------------
 
-    @app.get("/auth/google")
-    async def auth_google(request: Request):
-        redirect_uri = f"{_base_url(request)}/auth/callback"
-        flow = _make_flow(redirect_uri)
-        auth_url, state = flow.authorization_url(
-            access_type="offline",
-            include_granted_scopes="true",
-            prompt="consent",
+    @app.post("/register")
+    async def register_client(request: Request):
+        client_id = secrets.token_urlsafe(16)
+        return JSONResponse(
+            {
+                "client_id": client_id,
+                "client_id_issued_at": int(time.time()),
+                "token_endpoint_auth_method": "none",
+                "grant_types": ["authorization_code"],
+                "response_types": ["code"],
+            },
+            status_code=201,
         )
-        request.session["oauth_state"] = state
-        request.session["redirect_uri"] = redirect_uri
-        # Persist the PKCE code verifier so the callback can send it back to
-        # Google when exchanging the code (google-auth-oauthlib generates this
-        # automatically; the callback creates a new Flow so it must be restored).
-        if getattr(flow, "code_verifier", None):
-            request.session["code_verifier"] = flow.code_verifier
+
+    # ------------------------------------------------------------------
+    # Authorization endpoint
+    # Claude.ai sends the user here to sign in. We proxy to Google OAuth
+    # and, on success, redirect back to Claude.ai with our own auth code.
+    # ------------------------------------------------------------------
+
+    @app.get("/authorize")
+    async def authorize(
+        request: Request,
+        response_type: str = "code",
+        client_id: str = "",
+        redirect_uri: str = "",
+        state: str = "",
+        scope: str = "",
+        code_challenge: str = "",
+        code_challenge_method: str = "S256",
+    ):
+        oauth_session_id = secrets.token_urlsafe(16)
+        _pending_auths[oauth_session_id] = {
+            "client_redirect_uri": redirect_uri,
+            "client_state": state,
+            "code_challenge": code_challenge,
+            "code_challenge_method": code_challenge_method,
+        }
+
+        callback_uri = f"{_base_url(request)}/auth/callback"
+        flow = _make_flow(callback_uri)
+        # Pass our session ID as the Google OAuth state so we can recover
+        # the pending auth in the callback without relying on cookies.
+        auth_url, _ = flow.authorization_url(
+            access_type="offline",
+            prompt="consent",
+            state=oauth_session_id,
+        )
+        # Store the Google flow's code_verifier so the callback can use it.
+        _pending_auths[oauth_session_id]["google_code_verifier"] = getattr(
+            flow, "code_verifier", None
+        )
+        _pending_auths[oauth_session_id]["callback_uri"] = callback_uri
+
         return RedirectResponse(auth_url)
 
     # ------------------------------------------------------------------
-    # OAuth: callback
+    # Token endpoint
+    # Claude.ai exchanges the auth code for a bearer token here.
+    # ------------------------------------------------------------------
+
+    @app.post("/token")
+    async def token(request: Request):
+        form = await request.form()
+        grant_type = form.get("grant_type", "")
+        code = form.get("code", "")
+        code_verifier = form.get("code_verifier", "")
+
+        if grant_type != "authorization_code":
+            return JSONResponse(
+                {"error": "unsupported_grant_type"}, status_code=400
+            )
+
+        entry = _auth_codes.pop(code, None)
+        if not entry:
+            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+
+        if time.time() > entry["expires_at"]:
+            return JSONResponse(
+                {"error": "invalid_grant", "error_description": "Code expired"},
+                status_code=400,
+            )
+
+        # Verify PKCE if a code_challenge was stored.
+        if entry.get("code_challenge"):
+            if not code_verifier:
+                return JSONResponse(
+                    {
+                        "error": "invalid_request",
+                        "error_description": "code_verifier required",
+                    },
+                    status_code=400,
+                )
+            if not _verify_pkce(entry["code_challenge"], code_verifier):
+                return JSONResponse(
+                    {
+                        "error": "invalid_grant",
+                        "error_description": "PKCE verification failed",
+                    },
+                    status_code=400,
+                )
+
+        bearer_token = secrets.token_urlsafe(32)
+        _token_store[bearer_token] = {
+            "credentials": entry["credentials"],
+            "email": entry["email"],
+        }
+
+        return JSONResponse({
+            "access_token": bearer_token,
+            "token_type": "bearer",
+            "expires_in": 3600,
+            "scope": " ".join(_SCOPES),
+        })
+
+    # ------------------------------------------------------------------
+    # Google OAuth callback
+    # Handles redirects from both /auth/google (browser) and /authorize
+    # (MCP client flow).
     # ------------------------------------------------------------------
 
     @app.get("/auth/callback")
@@ -278,39 +381,43 @@ for your Google Analytics data.</p>
         error: str = "",
     ):
         if error:
-            safe_err = html.escape(error)
             return _page(
-                f"<h1>Sign-in failed</h1><p>{safe_err}</p>"
+                f"<h1>Sign-in failed</h1><p>{html.escape(error)}</p>"
                 '<p><a href="/">Try again</a></p>'
             )
 
-        stored_state = request.session.pop("oauth_state", None)
-        redirect_uri = request.session.pop("redirect_uri", None)
+        # Determine which flow triggered this callback.
+        is_mcp_flow = state in _pending_auths
 
-        if state != stored_state:
-            return _page(
-                "<h1>Invalid request</h1><p>OAuth state mismatch.</p>"
-                '<p><a href="/">Try again</a></p>',
-            )
-
-        code_verifier = request.session.pop("code_verifier", None)
+        if is_mcp_flow:
+            pending = _pending_auths.pop(state)
+            callback_uri = pending["callback_uri"]
+            code_verifier = pending.get("google_code_verifier")
+        else:
+            # Browser login via /auth/google
+            stored_state = request.session.pop("oauth_state", None)
+            if state != stored_state:
+                return _page(
+                    "<h1>Invalid request</h1><p>State mismatch.</p>"
+                    '<p><a href="/">Try again</a></p>'
+                )
+            callback_uri = request.session.pop("redirect_uri", None)
+            code_verifier = request.session.pop("code_verifier", None)
 
         try:
-            flow = _make_flow(redirect_uri)
+            flow = _make_flow(callback_uri)
             if code_verifier:
                 flow.code_verifier = code_verifier
             flow.fetch_token(code=code)
         except Exception as exc:
             logger.exception("fetch_token failed")
-            safe_exc = html.escape(str(exc))
             return _page(
-                f"<h1>Sign-in failed</h1><pre>{safe_exc}</pre>"
+                f"<h1>Sign-in failed</h1><pre>{html.escape(str(exc))}</pre>"
                 '<p><a href="/">Try again</a></p>'
             )
 
         creds = flow.credentials
 
-        # Fetch the user's email address.
         async with httpx.AsyncClient() as client:
             resp = await client.get(
                 "https://www.googleapis.com/oauth2/v2/userinfo",
@@ -320,27 +427,62 @@ for your Google Analytics data.</p>
         user_info = resp.json() if resp.is_success else {}
         user_email = user_info.get("email", "unknown")
 
-        bearer_token = secrets.token_urlsafe(32)
-        _token_store[bearer_token] = {
-            "credentials": {
-                "token": creds.token,
-                "refresh_token": creds.refresh_token,
-                "token_uri": creds.token_uri,
-                "client_id": creds.client_id,
-                "client_secret": creds.client_secret,
-                "scopes": list(creds.scopes) if creds.scopes else _SCOPES,
-            },
-            "email": user_email,
+        creds_data = {
+            "token": creds.token,
+            "refresh_token": creds.refresh_token,
+            "token_uri": creds.token_uri,
+            "client_id": creds.client_id,
+            "client_secret": creds.client_secret,
+            "scopes": list(creds.scopes) if creds.scopes else _SCOPES,
         }
 
-        request.session["user_email"] = user_email
-        request.session["bearer_token"] = bearer_token
-
-        return RedirectResponse("/")
+        if is_mcp_flow:
+            # Issue a short-lived auth code and redirect back to the MCP client.
+            auth_code = secrets.token_urlsafe(32)
+            _auth_codes[auth_code] = {
+                "credentials": creds_data,
+                "email": user_email,
+                "code_challenge": pending.get("code_challenge", ""),
+                "code_challenge_method": pending.get(
+                    "code_challenge_method", "S256"
+                ),
+                "expires_at": time.time() + 600,
+            }
+            sep = "&" if "?" in pending["client_redirect_uri"] else "?"
+            redirect_url = (
+                f"{pending['client_redirect_uri']}{sep}"
+                f"code={auth_code}&state={pending['client_state']}"
+            )
+            return RedirectResponse(redirect_url)
+        else:
+            # Browser login: store bearer token in session and go to homepage.
+            bearer_token = secrets.token_urlsafe(32)
+            _token_store[bearer_token] = {
+                "credentials": creds_data,
+                "email": user_email,
+            }
+            request.session["user_email"] = user_email
+            request.session["bearer_token"] = bearer_token
+            return RedirectResponse("/")
 
     # ------------------------------------------------------------------
-    # OAuth: logout
+    # Browser-based login entry point (convenience)
     # ------------------------------------------------------------------
+
+    @app.get("/auth/google")
+    async def auth_google(request: Request):
+        callback_uri = f"{_base_url(request)}/auth/callback"
+        flow = _make_flow(callback_uri)
+        auth_url, state = flow.authorization_url(
+            access_type="offline",
+            include_granted_scopes="true",
+            prompt="consent",
+        )
+        request.session["oauth_state"] = state
+        request.session["redirect_uri"] = callback_uri
+        if getattr(flow, "code_verifier", None):
+            request.session["code_verifier"] = flow.code_verifier
+        return RedirectResponse(auth_url)
 
     @app.get("/auth/logout")
     async def auth_logout(request: Request):
@@ -351,6 +493,36 @@ for your Google Analytics data.</p>
         return RedirectResponse("/")
 
     # ------------------------------------------------------------------
+    # Landing page
+    # ------------------------------------------------------------------
+
+    @app.get("/")
+    async def index(request: Request):
+        base = _base_url(request)
+        user_email = request.session.get("user_email")
+
+        if user_email:
+            safe_email = html.escape(user_email)
+            body = f"""\
+<h1>Google Analytics MCP Server</h1>
+<p>Signed in as <strong>{safe_email}</strong></p>
+<span class="label">Add this server URL to Claude.ai MCP connector:</span>
+<pre>{html.escape(base)}/sse</pre>
+<p>Claude.ai will handle authentication automatically.</p>
+<p><a href="/auth/logout" class="logout">Sign out</a></p>"""
+        else:
+            body = f"""\
+<h1>Google Analytics MCP Server</h1>
+<p>Add this URL to Claude.ai as a remote MCP server and Claude.ai will
+prompt you to sign in with Google automatically.</p>
+<span class="label">MCP server URL:</span>
+<pre>{html.escape(base)}/sse</pre>
+<br>
+<a href="/auth/google" class="btn">Sign in with Google</a>"""
+
+        return _page(body)
+
+    # ------------------------------------------------------------------
     # MCP SSE endpoint
     # ------------------------------------------------------------------
 
@@ -359,10 +531,6 @@ for your Google Analytics data.</p>
         request: Request,
         token: Optional[str] = Query(default=None),
     ):
-        # Accept token from:
-        #   1. ?token= query param  (easiest for MCP client config URLs)
-        #   2. Authorization: Bearer <token> header
-        #   3. Session cookie (set after browser login)
         resolved = token
         if not resolved:
             auth_header = request.headers.get("authorization", "")
@@ -372,17 +540,21 @@ for your Google Analytics data.</p>
             resolved = request.session.get("bearer_token")
 
         if not resolved or resolved not in _token_store:
-            return _page(
-                "<h1>Unauthorised</h1>"
-                "<p>Please <a href='/auth/google'>sign in</a> first.</p>"
+            # Return 401 with WWW-Authenticate so Claude.ai triggers OAuth flow.
+            base = _base_url(request)
+            return Response(
+                status_code=401,
+                headers={
+                    "WWW-Authenticate": (
+                        f'Bearer realm="{base}",'
+                        f' resource_metadata="{base}/.well-known/oauth-authorization-server"'
+                    )
+                },
             )
 
         credentials = _credentials_from_store(
             _token_store[resolved]["credentials"]
         )
-
-        # Store credentials in the async context so all tool calls in this
-        # MCP session use this user's Google credentials.
         ctx_token = _credentials_ctx.set(credentials)
         try:
             async with sse.connect_sse(
@@ -394,7 +566,6 @@ for your Google Analytics data.</p>
         finally:
             _credentials_ctx.reset(ctx_token)
 
-    # Mount the SSE message handler (client POSTs tool calls here).
     app.mount("/messages/", sse.handle_post_message)
 
     return app
@@ -406,13 +577,6 @@ for your Google Analytics data.</p>
 
 
 def run_web_server():
-    """Start the web server (used by the analytics-mcp-web CLI entry point)."""
     import uvicorn
-
-    # Allow HTTP during local development without triggering oauthlib's
-    # HTTPS-only guard.
-    if os.environ.get("ENV", "production").lower() == "development":
-        os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
-
     port = int(os.environ.get("PORT", 8080))
     uvicorn.run(create_app(), host="0.0.0.0", port=port, log_level="info")
