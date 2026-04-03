@@ -53,6 +53,11 @@ from starlette.middleware.sessions import SessionMiddleware
 import analytics_mcp.coordinator as coordinator
 from analytics_mcp.tools.utils import _credentials_ctx
 
+# Railway (and most reverse proxies) terminate TLS before the app sees the
+# request, so oauthlib will reject redirect URIs as "insecure" even though
+# they are HTTPS at the edge. This flag disables that transport check.
+os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -280,19 +285,9 @@ for your Google Analytics data.</p>
                 '<p><a href="/">Try again</a></p>',
             )
 
-        # Build the full callback URL, forcing HTTPS so oauthlib doesn't
-        # reject it when Railway terminates TLS upstream.
-        callback_url = str(request.url)
-        if callback_url.startswith("http://"):
-            callback_url = "https://" + callback_url[7:]
-
-        # oauthlib requires HTTPS on the redirect URI; Railway terminates
-        # TLS before the app sees the request, so we set this flag.
-        os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
-
         try:
             flow = _make_flow(redirect_uri)
-            flow.fetch_token(authorization_response=callback_url)
+            flow.fetch_token(code=code)
         except Exception as exc:
             logger.exception("fetch_token failed")
             safe_exc = html.escape(str(exc))
@@ -300,8 +295,6 @@ for your Google Analytics data.</p>
                 f"<h1>Sign-in failed</h1><pre>{safe_exc}</pre>"
                 '<p><a href="/">Try again</a></p>'
             )
-        finally:
-            os.environ.pop("OAUTHLIB_INSECURE_TRANSPORT", None)
 
         creds = flow.credentials
 
