@@ -70,6 +70,12 @@ _token_store: Dict[str, Dict[str, Any]] = {}   # bearer_token -> {credentials, e
 _auth_codes: Dict[str, Dict[str, Any]] = {}    # auth_code   -> {credentials, …, expires_at}
 _pending_auths: Dict[str, Dict[str, Any]] = {} # oauth_session_id -> {client params, …}
 
+# Scope fingerprint — stable 12-char hex used as OAuth realm and ETag on
+# well-known responses, matching the pattern from google_workspace_mcp.
+_SCOPE_FINGERPRINT: str = hashlib.sha256(
+    " ".join(sorted(_SCOPES)).encode()
+).hexdigest()[:12]
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -172,13 +178,22 @@ def create_app() -> FastAPI:
     # follows authorization_servers to find the authorization server.
     # ------------------------------------------------------------------
 
+    _wk_headers = {
+        "Cache-Control": "no-store, must-revalidate",
+        "ETag": f'"{_SCOPE_FINGERPRINT}"',
+    }
+
     @app.get("/.well-known/oauth-protected-resource")
     async def protected_resource_metadata(request: Request):
         base = _base_url(request)
-        return JSONResponse({
-            "resource": base,
-            "authorization_servers": [base],
-        })
+        return JSONResponse(
+            {
+                "resource": base,
+                "authorization_servers": [base],
+                "scopes_supported": _SCOPES,
+            },
+            headers=_wk_headers,
+        )
 
     # ------------------------------------------------------------------
     # OAuth 2.0 Authorization Server Metadata  (MCP spec / RFC 8414)
@@ -187,16 +202,20 @@ def create_app() -> FastAPI:
     @app.get("/.well-known/oauth-authorization-server")
     async def oauth_metadata(request: Request):
         base = _base_url(request)
-        return JSONResponse({
-            "issuer": base,
-            "authorization_endpoint": f"{base}/authorize",
-            "token_endpoint": f"{base}/token",
-            "registration_endpoint": f"{base}/register",
-            "response_types_supported": ["code"],
-            "grant_types_supported": ["authorization_code"],
-            "code_challenge_methods_supported": ["S256"],
-            "token_endpoint_auth_methods_supported": ["none"],
-        })
+        return JSONResponse(
+            {
+                "issuer": base,
+                "authorization_endpoint": f"{base}/authorize",
+                "token_endpoint": f"{base}/token",
+                "registration_endpoint": f"{base}/register",
+                "response_types_supported": ["code"],
+                "grant_types_supported": ["authorization_code"],
+                "code_challenge_methods_supported": ["S256"],
+                "token_endpoint_auth_methods_supported": ["none"],
+                "scopes_supported": _SCOPES,
+            },
+            headers=_wk_headers,
+        )
 
     # ------------------------------------------------------------------
     # Dynamic Client Registration  (RFC 7591)
@@ -402,9 +421,7 @@ def create_app() -> FastAPI:
                 return Response(
                     status_code=401,
                     headers={
-                        "WWW-Authenticate": (
-                            f'Bearer resource_metadata="{base}/.well-known/oauth-protected-resource"'
-                        )
+                        "WWW-Authenticate": f'Bearer realm="{_SCOPE_FINGERPRINT}"',
                     },
                 )
 
