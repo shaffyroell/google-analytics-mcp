@@ -292,6 +292,28 @@ def create_app() -> Starlette:
     )
 
     # ------------------------------------------------------------------
+    # Override /.well-known/oauth-authorization-server to include "none"
+    # in token_endpoint_auth_methods_supported. The SDK's built-in metadata
+    # only advertises client_secret_post and client_secret_basic; Claude.ai
+    # is a public client that uses "none", so we must advertise it.
+    # ------------------------------------------------------------------
+
+    async def oauth_server_metadata(request: Request) -> JSONResponse:
+        base = _get_base_url(request)
+        metadata = {
+            "issuer": base,
+            "authorization_endpoint": f"{base}/authorize",
+            "token_endpoint": f"{base}/token",
+            "registration_endpoint": f"{base}/register",
+            "scopes_supported": _SCOPES,
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code", "refresh_token"],
+            "token_endpoint_auth_methods_supported": ["none", "client_secret_post", "client_secret_basic"],
+            "code_challenge_methods_supported": ["S256"],
+        }
+        return JSONResponse(metadata, headers={"Cache-Control": "no-store"})
+
+    # ------------------------------------------------------------------
     # Custom /register — must come BEFORE auth_routes in the route list
     # so it takes priority over the SDK's built-in handler.
     #
@@ -308,6 +330,7 @@ def create_app() -> Starlette:
         except Exception:
             return JSONResponse({"error": "invalid_client_metadata"}, status_code=400)
 
+        logger.info("CLIENT REGISTRATION: body=%s", body)
         grant_types: list = body.get("grant_types", ["authorization_code", "refresh_token"])
         # Add refresh_token so the SDK's /authorize + /token handlers are happy.
         if "authorization_code" not in grant_types:
@@ -348,6 +371,7 @@ def create_app() -> Starlette:
             scope=" ".join(_SCOPES),
         )
         await provider.register_client(client_info)
+        logger.info("CLIENT REGISTERED: client_id=%s auth_method=%s has_secret=%s", client_id, auth_method, client_secret is not None)
 
         resp_body: dict = {
             "client_id": client_id,
@@ -544,6 +568,7 @@ def create_app() -> Starlette:
                     access_token_obj = await provider.load_access_token(token)
 
                 if not access_token_obj or not token or token not in provider._tokens:
+                    logger.warning("MCP /mcp: 401 — token=%s valid=%s", bool(token), bool(access_token_obj))
                     resp = Response(
                         status_code=401,
                         headers={"WWW-Authenticate": f'Bearer realm="{_SCOPE_FINGERPRINT}"'},
@@ -566,10 +591,10 @@ def create_app() -> Starlette:
     # ------------------------------------------------------------------
 
     routes = [
-        # Custom /register MUST come before auth_routes so it takes priority
-        # over the SDK's built-in handler (which rejects Claude.ai's registration).
+        # These MUST come before auth_routes to shadow the SDK's built-in handlers.
+        Route("/.well-known/oauth-authorization-server", oauth_server_metadata, methods=["GET"]),
         Route("/register", register_client, methods=["POST"]),
-        *auth_routes,  # /.well-known/oauth-authorization-server, /authorize, /token (and /register — shadowed above)
+        *auth_routes,  # /authorize, /token (/.well-known/oauth-authorization-server and /register shadowed above)
         Route("/.well-known/oauth-protected-resource", protected_resource_metadata),
         Route("/auth/callback", auth_callback),
         Route("/auth/google", auth_google),
