@@ -256,6 +256,11 @@ for your Google Analytics data.</p>
         )
         request.session["oauth_state"] = state
         request.session["redirect_uri"] = redirect_uri
+        # Persist the PKCE code verifier so the callback can send it back to
+        # Google when exchanging the code (google-auth-oauthlib generates this
+        # automatically; the callback creates a new Flow so it must be restored).
+        if getattr(flow, "code_verifier", None):
+            request.session["code_verifier"] = flow.code_verifier
         return RedirectResponse(auth_url)
 
     # ------------------------------------------------------------------
@@ -285,8 +290,12 @@ for your Google Analytics data.</p>
                 '<p><a href="/">Try again</a></p>',
             )
 
+        code_verifier = request.session.pop("code_verifier", None)
+
         try:
             flow = _make_flow(redirect_uri)
+            if code_verifier:
+                flow.code_verifier = code_verifier
             flow.fetch_token(code=code)
         except Exception as exc:
             logger.exception("fetch_token failed")
