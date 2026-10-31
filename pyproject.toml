@@ -11,7 +11,8 @@ dependencies = [
     "google-analytics-data==0.20.0",
     "google-analytics-admin==0.27.0",
     "google-auth~=2.40",
-    "mcp>=1.24.0",
+    # mcp 2.x changed the server/auth APIs the web server is built on.
+    "mcp>=1.24.0,<2",
     "google-adk>=1.24.1",
     "httpx>=0.28.1",
 ]
@@ -57,6 +58,7 @@ web = [
     "google-auth-oauthlib>=1.2.0",
     "itsdangerous>=2.2.0",
     "starlette>=0.46.0",
+    "cryptography>=42.0.0",
 ]
 
 [build-system]

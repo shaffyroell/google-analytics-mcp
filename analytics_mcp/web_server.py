@@ -23,25 +23,45 @@ Setup
 -----
   GOOGLE_CLIENT_ID      – OAuth 2.0 Web Application client ID
   GOOGLE_CLIENT_SECRET  – OAuth 2.0 client secret
-  SECRET_KEY            – Cookie signing secret (auto-generated if unset)
+  SECRET_KEY            – Encrypts the tokens issued to Claude and signs
+                          cookies. Set it to a long random value and never
+                          change it, or every connected client is signed
+                          out. If unset it is derived from
+                          GOOGLE_CLIENT_SECRET.
   BASE_URL              – Public URL, e.g. https://my-app.up.railway.app
   PORT                  – Listen port (default: 8080)
 
 Add  <BASE_URL>/auth/callback  as an authorised redirect URI in Google
 Cloud Console.
+
+Staying signed in
+-----------------
+Everything Claude holds is self-contained, so nothing is lost on a restart
+or redeploy: client registrations are signed into the client_id, and access
+and refresh tokens are encrypted payloads carrying the user's Google
+credentials. Claude refreshes silently; users only reconnect if they revoke
+access at Google — or if the Google OAuth app is left in "Testing", where
+Google expires refresh tokens after 7 days.
 """
 
 import base64
 import contextlib
 import hashlib
+import hmac
 import html
+import json
 import logging
 import os
 import secrets
 import time
+from datetime import datetime, timezone
 from typing import Any
 
+import anyio
 import httpx
+from cryptography.fernet import Fernet, InvalidToken
+from google.auth.exceptions import RefreshError
+from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from mcp.server.auth.provider import (
@@ -49,6 +69,7 @@ from mcp.server.auth.provider import (
     AuthorizationCode,
     AuthorizationParams,
     OAuthAuthorizationServerProvider,
+    RefreshToken,
     TokenError,
 )
 from mcp.server.auth.routes import create_auth_routes
@@ -60,8 +81,13 @@ from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
-from starlette.routing import Mount, Route
+from starlette.responses import (
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+)
+from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
 
 import analytics_mcp.coordinator as coordinator
@@ -90,6 +116,7 @@ _SCOPE_FINGERPRINT: str = hashlib.sha256(
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _require_env(name: str) -> str:
     v = os.environ.get(name)
     if not v:
@@ -116,18 +143,77 @@ def _make_flow(redirect_uri: str) -> Flow:
             "redirect_uris": [redirect_uri],
         }
     }
-    return Flow.from_client_config(client_config, scopes=_SCOPES, redirect_uri=redirect_uri)
+    return Flow.from_client_config(
+        client_config, scopes=_SCOPES, redirect_uri=redirect_uri
+    )
 
 
 def _creds_from_store(data: dict) -> Credentials:
-    return Credentials(
+    """Rebuild Google credentials from a token payload.
+
+    The OAuth client id/secret come from the environment. ``expiry`` must be
+    set, or google-auth treats the ~1h Google access token as valid forever
+    and never refreshes it; a missing expiry is treated as already expired.
+    """
+    expiry_ts = data.get("expiry")
+    expiry = (
+        datetime.fromtimestamp(expiry_ts, timezone.utc).replace(tzinfo=None)
+        if expiry_ts
+        else datetime(1970, 1, 1)
+    )
+    creds = Credentials(
         token=data["token"],
         refresh_token=data.get("refresh_token"),
         token_uri=data.get("token_uri", "https://oauth2.googleapis.com/token"),
-        client_id=data["client_id"],
-        client_secret=data["client_secret"],
+        client_id=os.environ.get("GOOGLE_CLIENT_ID"),
+        client_secret=os.environ.get("GOOGLE_CLIENT_SECRET"),
         scopes=data.get("scopes"),
     )
+    creds.expiry = expiry
+    return creds
+
+
+def _creds_to_store(creds: Credentials) -> dict:
+    """Serialise Google credentials for embedding in an encrypted token.
+
+    The OAuth client id/secret are deliberately left out — they live in env.
+    """
+    expiry = None
+    if creds.expiry:
+        expiry = int(creds.expiry.replace(tzinfo=timezone.utc).timestamp())
+    return {
+        "token": creds.token,
+        "refresh_token": creds.refresh_token,
+        "token_uri": creds.token_uri,
+        "scopes": list(creds.scopes) if creds.scopes else _SCOPES,
+        "expiry": expiry,
+    }
+
+
+# Refreshed Google access tokens, keyed by a hash of the Google refresh
+# token. Bearer tokens are immutable, so without this every request made
+# more than an hour after the bearer was minted would hit Google's token
+# endpoint. Purely an optimisation: losing it on restart costs one refresh.
+_google_token_cache: dict[str, tuple[str, datetime]] = {}
+
+
+def _cache_key(creds: Credentials) -> str | None:
+    if not creds.refresh_token:
+        return None
+    return hashlib.sha256(creds.refresh_token.encode()).hexdigest()
+
+
+def _apply_cached_google_token(creds: Credentials) -> None:
+    key = _cache_key(creds)
+    cached = _google_token_cache.get(key) if key else None
+    if cached and (creds.expiry is None or cached[1] > creds.expiry):
+        creds.token, creds.expiry = cached
+
+
+def _remember_google_token(creds: Credentials) -> None:
+    key = _cache_key(creds)
+    if key and creds.token and creds.expiry:
+        _google_token_cache[key] = (creds.token, creds.expiry)
 
 
 async def _fetch_email(access_token: str) -> str:
@@ -159,26 +245,215 @@ def _page(body: str) -> HTMLResponse:
 # OAuth provider — proxies identity to Google
 # ---------------------------------------------------------------------------
 
-class GoogleOAuthProvider(OAuthAuthorizationServerProvider):
-    """MCP OAuth AS that proxies authentication to Google OAuth 2.0."""
+_ACCESS_TOKEN_TTL = 8 * 3600  # 8 hours; Claude refreshes silently
+_REFRESH_TOKEN_TTL = 365 * 24 * 3600  # 1 year, renewed on every refresh
+_CLIENT_ID_PREFIX = "mcpc_"
 
-    def __init__(self) -> None:
-        # Registered MCP clients (dynamic registration)
-        self._clients: dict[str, OAuthClientInformationFull] = {}
+
+def _b64e(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _b64d(text: str) -> bytes:
+    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+
+def _resolve_secret_key() -> str:
+    explicit = os.environ.get("SECRET_KEY")
+    if explicit:
+        return explicit
+    google_secret = os.environ.get("GOOGLE_CLIENT_SECRET")
+    if google_secret:
+        logger.warning(
+            "SECRET_KEY is not set; deriving one from GOOGLE_CLIENT_SECRET so "
+            "tokens survive restarts. Set SECRET_KEY explicitly for "
+            "production."
+        )
+        return hashlib.sha256(
+            b"analytics-mcp/secret-key:" + google_secret.encode()
+        ).hexdigest()
+    logger.warning(
+        "SECRET_KEY is not set and there is no GOOGLE_CLIENT_SECRET to derive "
+        "one from: using a random key. Every restart will sign clients out."
+    )
+    return secrets.token_hex(32)
+
+
+class _TokenCodec:
+    """Encrypts/decrypts token payloads and signs client IDs.
+
+    Tokens are Fernet-encrypted (AES + HMAC) because they carry the user's
+    Google refresh token. Client IDs are only signed: they are not secret.
+    """
+
+    def __init__(self, secret: str) -> None:
+        self._secret = secret
+        fernet_key = base64.urlsafe_b64encode(
+            hashlib.sha256(b"analytics-mcp/fernet:" + secret.encode()).digest()
+        )
+        self._fernet = Fernet(fernet_key)
+
+    def _mac(self, purpose: str, data: str) -> str:
+        return hmac.new(
+            self._secret.encode(),
+            f"{purpose}:{data}".encode(),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def encode(self, payload: dict) -> str:
+        return self._fernet.encrypt(json.dumps(payload).encode()).decode()
+
+    def decode(self, token: str, typ: str) -> dict | None:
+        """Return the payload if ``token`` is a valid, unexpired ``typ``."""
+        try:
+            payload = json.loads(self._fernet.decrypt(token.encode()))
+        except (InvalidToken, ValueError, TypeError):
+            return None
+        if payload.get("typ") != typ:
+            return None
+        if time.time() > payload.get("expires_at", 0):
+            return None
+        return payload
+
+    def encode_client_id(self, meta: dict) -> str:
+        body = _b64e(json.dumps(meta, separators=(",", ":")).encode())
+        sig = self._mac("client-id", body)[:32]
+        return f"{_CLIENT_ID_PREFIX}{body}.{sig}"
+
+    def decode_client_id(self, client_id: str) -> dict | None:
+        if not client_id.startswith(_CLIENT_ID_PREFIX):
+            return None
+        try:
+            body, sig = client_id[len(_CLIENT_ID_PREFIX) :].rsplit(".", 1)
+            if not hmac.compare_digest(sig, self._mac("client-id", body)[:32]):
+                return None
+            return json.loads(_b64d(body))
+        except Exception:
+            return None
+
+    def client_secret_for(self, client_id: str) -> str:
+        return self._mac("client-secret", client_id)
+
+
+class GoogleOAuthProvider(OAuthAuthorizationServerProvider):
+    """MCP OAuth AS that proxies authentication to Google OAuth 2.0.
+
+    Stateless across restarts: client registrations, access tokens and
+    refresh tokens are all self-contained. Only the short-lived (~minutes)
+    login handshake state lives in memory.
+    """
+
+    def __init__(self, secret_key: str) -> None:
+        self._codec = _TokenCodec(secret_key)
         # MCP auth codes issued after Google callback
         self._auth_codes: dict[str, AuthorizationCode] = {}
         # Google credentials associated with each MCP auth code
         self._auth_code_creds: dict[str, dict] = {}
-        # Issued bearer tokens → credentials + metadata
-        self._tokens: dict[str, dict[str, Any]] = {}
         # Pending Google OAuth flows keyed by google_state
         self._pending: dict[str, dict[str, Any]] = {}
 
-    async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
-        return self._clients.get(client_id)
+    # --- clients -----------------------------------------------------------
 
-    async def register_client(self, client_info: OAuthClientInformationFull) -> None:
-        self._clients[client_info.client_id] = client_info
+    def new_client(
+        self,
+        redirect_uris: list[str],
+        auth_method: str,
+        grant_types: list[str],
+        response_types: list[str],
+    ) -> OAuthClientInformationFull:
+        client_id = self._codec.encode_client_id(
+            {
+                "r": redirect_uris,
+                "m": auth_method,
+                "g": grant_types,
+                "t": response_types,
+                "i": int(time.time()),
+            }
+        )
+        meta = self._codec.decode_client_id(client_id)
+        return self._client_from_meta(client_id, meta)
+
+    def _client_from_meta(
+        self, client_id: str, meta: dict
+    ) -> OAuthClientInformationFull:
+        auth_method = meta["m"]
+        # Pass redirect_uris as plain strings so Pydantic converts them to
+        # AnyUrl (the field type on OAuthClientInformationFull); AnyHttpUrl
+        # would make validate_redirect_uri() comparisons fail silently.
+        return OAuthClientInformationFull(
+            client_id=client_id,
+            client_secret=(
+                self._codec.client_secret_for(client_id)
+                if auth_method != "none"
+                else None
+            ),
+            client_id_issued_at=meta["i"],
+            redirect_uris=meta["r"],
+            token_endpoint_auth_method=auth_method,
+            grant_types=meta["g"],
+            response_types=meta["t"],
+            scope=" ".join(_SCOPES),
+        )
+
+    async def get_client(
+        self, client_id: str
+    ) -> OAuthClientInformationFull | None:
+        meta = self._codec.decode_client_id(client_id)
+        if meta is None:
+            return None
+        return self._client_from_meta(client_id, meta)
+
+    async def register_client(
+        self, client_info: OAuthClientInformationFull
+    ) -> None:
+        # Registration goes through the custom /register route, which mints
+        # stateless client ids via new_client(); nothing to store.
+        pass
+
+    # --- tokens ------------------------------------------------------------
+
+    def _issue_tokens(
+        self, creds_data: dict, email: str, client_id: str, scopes: list[str]
+    ) -> OAuthToken:
+        now = int(time.time())
+        common = {
+            "credentials": creds_data,
+            "email": email,
+            "client_id": client_id,
+            "scopes": list(scopes),
+        }
+        access = self._codec.encode(
+            {**common, "typ": "access", "expires_at": now + _ACCESS_TOKEN_TTL}
+        )
+        refresh = self._codec.encode(
+            {
+                **common,
+                "typ": "refresh",
+                "expires_at": now + _REFRESH_TOKEN_TTL,
+            }
+        )
+        return OAuthToken(
+            access_token=access,
+            token_type="Bearer",
+            expires_in=_ACCESS_TOKEN_TTL,
+            scope=" ".join(scopes),
+            refresh_token=refresh,
+        )
+
+    def browser_session_token(self, creds_data: dict, email: str) -> str:
+        return self._codec.encode(
+            {
+                "credentials": creds_data,
+                "email": email,
+                "client_id": "browser",
+                "scopes": _SCOPES,
+                "typ": "access",
+                "expires_at": int(time.time()) + 86400,
+            }
+        )
+
+    def decode_access_token(self, token: str) -> dict | None:
+        return self._codec.decode(token, typ="access")
 
     async def authorize(
         self, client: OAuthClientInformationFull, params: AuthorizationParams
@@ -210,67 +485,119 @@ class GoogleOAuthProvider(OAuthAuthorizationServerProvider):
         return self._auth_codes.get(authorization_code)
 
     async def exchange_authorization_code(
-        self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
+        self,
+        client: OAuthClientInformationFull,
+        authorization_code: AuthorizationCode,
     ) -> OAuthToken:
         creds_data = self._auth_code_creds.pop(authorization_code.code, None)
         if creds_data is None:
-            raise TokenError(error="invalid_grant", error_description="Credentials not found")
+            raise TokenError(
+                error="invalid_grant", error_description="Credentials not found"
+            )
 
-        del self._auth_codes[authorization_code.code]
+        self._auth_codes.pop(authorization_code.code, None)
 
-        bearer = secrets.token_urlsafe(32)
-        self._tokens[bearer] = {
-            "credentials": creds_data["credentials"],
-            "email": creds_data["email"],
-            "client_id": client.client_id,
-            "scopes": authorization_code.scopes,
-            "expires_at": int(time.time()) + 3600,
-        }
-        return OAuthToken(
-            access_token=bearer,
-            token_type="Bearer",
-            expires_in=3600,
-            scope=" ".join(authorization_code.scopes),
+        return self._issue_tokens(
+            creds_data["credentials"],
+            creds_data["email"],
+            client.client_id,
+            list(authorization_code.scopes),
         )
 
-    async def load_refresh_token(self, client: OAuthClientInformationFull, refresh_token: str):
-        return None  # Refresh tokens not supported
+    async def load_refresh_token(
+        self, client: OAuthClientInformationFull, refresh_token: str
+    ) -> RefreshToken | None:
+        payload = self._codec.decode(refresh_token, typ="refresh")
+        if payload is None:
+            return None
+        return RefreshToken(
+            token=refresh_token,
+            client_id=payload["client_id"],
+            scopes=payload["scopes"],
+            expires_at=payload["expires_at"],
+        )
 
-    async def exchange_refresh_token(self, client, refresh_token, scopes):
-        raise TokenError(error="unsupported_grant_type")
+    async def exchange_refresh_token(
+        self,
+        client: OAuthClientInformationFull,
+        refresh_token: RefreshToken,
+        scopes: list[str],
+    ) -> OAuthToken:
+        payload = self._codec.decode(refresh_token.token, typ="refresh")
+        if payload is None:
+            raise TokenError(
+                error="invalid_grant",
+                error_description="refresh token is invalid",
+            )
+
+        # Refresh the Google access token now, so the new bearer starts with
+        # a fresh one and a revoked/expired Google grant surfaces here as
+        # invalid_grant (Claude then asks the user to reconnect) rather than
+        # as confusing tool errors later.
+        creds = _creds_from_store(payload["credentials"])
+        try:
+            await anyio.to_thread.run_sync(creds.refresh, GoogleAuthRequest())
+        except RefreshError as exc:
+            logger.warning(
+                "Google refresh failed for %s: %s", payload.get("email"), exc
+            )
+            raise TokenError(
+                error="invalid_grant",
+                error_description=(
+                    "Google authorization expired or was revoked; "
+                    "please reconnect"
+                ),
+            ) from exc
+        except Exception:
+            # Transient (network, Google 5xx): don't sign the user out over
+            # it. Keep the old Google token; it is refreshed on first use.
+            logger.exception(
+                "Transient error refreshing Google token; keeping existing "
+                "credentials"
+            )
+        else:
+            _remember_google_token(creds)
+            # Google normally omits refresh_token on refresh; google-auth
+            # keeps the existing one on the credentials object.
+            payload["credentials"] = _creds_to_store(creds)
+
+        logger.info("Refreshed MCP tokens for %s", payload.get("email"))
+        return self._issue_tokens(
+            payload["credentials"], payload["email"], client.client_id, scopes
+        )
 
     async def load_access_token(self, token: str) -> AccessToken | None:
-        entry = self._tokens.get(token)
-        if not entry:
-            return None
-        if time.time() > entry["expires_at"]:
+        payload = self.decode_access_token(token)
+        if payload is None:
             return None
         return AccessToken(
             token=token,
-            client_id=entry["client_id"],
-            scopes=entry["scopes"],
-            expires_at=entry["expires_at"],
+            client_id=payload["client_id"],
+            scopes=payload["scopes"],
+            expires_at=payload["expires_at"],
         )
 
-    async def revoke_token(self, token: AccessToken) -> None:
-        self._tokens.pop(token.token, None)
+    async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
+        pass  # stateless tokens cannot be revoked; they expire naturally
 
 
 # ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
 
+
 def create_app() -> Starlette:
-    secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
+    secret_key = _resolve_secret_key()
     base_url = os.environ.get("BASE_URL", "").rstrip("/")
 
-    provider = GoogleOAuthProvider()
+    provider = GoogleOAuthProvider(secret_key)
 
+    # Stateless: every request is authenticated and carries its own
+    # credentials, so nothing breaks when Railway restarts the process.
     session_manager = StreamableHTTPSessionManager(
         app=coordinator.app,
         json_response=False,
-        stateless=False,
-        session_idle_timeout=1800,
+        stateless=True,
     )
 
     # ------------------------------------------------------------------
@@ -308,7 +635,11 @@ def create_app() -> Starlette:
             "scopes_supported": _SCOPES,
             "response_types_supported": ["code"],
             "grant_types_supported": ["authorization_code", "refresh_token"],
-            "token_endpoint_auth_methods_supported": ["none", "client_secret_post", "client_secret_basic"],
+            "token_endpoint_auth_methods_supported": [
+                "none",
+                "client_secret_post",
+                "client_secret_basic",
+            ],
             "code_challenge_methods_supported": ["S256"],
         }
         return JSONResponse(metadata, headers={"Cache-Control": "no-store"})
@@ -328,15 +659,21 @@ def create_app() -> Starlette:
         try:
             body = await request.json()
         except Exception:
-            return JSONResponse({"error": "invalid_client_metadata"}, status_code=400)
+            return JSONResponse(
+                {"error": "invalid_client_metadata"}, status_code=400
+            )
 
         logger.info("CLIENT REGISTRATION: body=%s", body)
-        grant_types: list = body.get("grant_types", ["authorization_code", "refresh_token"])
+        grant_types: list = body.get(
+            "grant_types", ["authorization_code", "refresh_token"]
+        )
         # Add refresh_token so the SDK's /authorize + /token handlers are happy.
         if "authorization_code" not in grant_types:
             return JSONResponse(
-                {"error": "invalid_client_metadata",
-                 "error_description": "grant_types must include authorization_code"},
+                {
+                    "error": "invalid_client_metadata",
+                    "error_description": "grant_types must include authorization_code",
+                },
                 status_code=400,
             )
         if "refresh_token" not in grant_types:
@@ -345,37 +682,49 @@ def create_app() -> Starlette:
         redirect_uris_raw: list = body.get("redirect_uris", [])
         if not redirect_uris_raw:
             return JSONResponse(
-                {"error": "invalid_client_metadata",
-                 "error_description": "redirect_uris is required"},
+                {
+                    "error": "invalid_client_metadata",
+                    "error_description": "redirect_uris is required",
+                },
                 status_code=400,
             )
 
         auth_method: str = body.get("token_endpoint_auth_method") or "none"
-        client_secret = secrets.token_hex(32) if auth_method != "none" else None
+        if auth_method not in (
+            "none",
+            "client_secret_post",
+            "client_secret_basic",
+        ):
+            return JSONResponse(
+                {
+                    "error": "invalid_client_metadata",
+                    "error_description": (
+                        "unsupported token_endpoint_auth_method "
+                        f"{auth_method}"
+                    ),
+                },
+                status_code=400,
+            )
 
-        client_id = str(__import__("uuid").uuid4())
-        issued_at = int(time.time())
-
-        # Pass redirect_uris as plain strings so Pydantic converts them to
-        # AnyUrl (the field type on OAuthClientInformationFull). Using AnyHttpUrl
-        # here would cause AnyHttpUrl != AnyUrl comparisons to fail silently in
-        # validate_redirect_uri() even when the URL strings are identical.
-        client_info = OAuthClientInformationFull(
-            client_id=client_id,
-            client_secret=client_secret,
-            client_id_issued_at=issued_at,
-            redirect_uris=redirect_uris_raw,  # plain strings → Pydantic → AnyUrl
-            token_endpoint_auth_method=auth_method,
-            grant_types=grant_types,
+        # Stateless client id: the registration is encoded (and signed) in
+        # the id itself, so it is still valid after a restart or redeploy.
+        client_info = provider.new_client(
+            redirect_uris=[str(u) for u in redirect_uris_raw],
+            auth_method=auth_method,
+            grant_types=list(grant_types),
             response_types=body.get("response_types", ["code"]),
-            scope=" ".join(_SCOPES),
         )
-        await provider.register_client(client_info)
-        logger.info("CLIENT REGISTERED: client_id=%s auth_method=%s has_secret=%s", client_id, auth_method, client_secret is not None)
+        client_id = client_info.client_id
+        client_secret = client_info.client_secret
+        logger.info(
+            "CLIENT REGISTERED: auth_method=%s redirect_uris=%s",
+            auth_method,
+            redirect_uris_raw,
+        )
 
         resp_body: dict = {
             "client_id": client_id,
-            "client_id_issued_at": issued_at,
+            "client_id_issued_at": client_info.client_id_issued_at,
             "redirect_uris": redirect_uris_raw,
             "grant_types": grant_types,
             "response_types": ["code"],
@@ -398,7 +747,11 @@ def create_app() -> Starlette:
     async def protected_resource_metadata(request: Request) -> JSONResponse:
         base = _get_base_url(request)
         return JSONResponse(
-            {"resource": base, "authorization_servers": [base], "scopes_supported": _SCOPES},
+            {
+                "resource": base,
+                "authorization_servers": [base],
+                "scopes_supported": _SCOPES,
+            },
             headers=_wk_headers,
         )
 
@@ -412,7 +765,9 @@ def create_app() -> Starlette:
         error = request.query_params.get("error", "")
 
         if error:
-            return _page(f"<h1>Sign-in failed</h1><p>{html.escape(error)}</p><p><a href='/'>Try again</a></p>")
+            return _page(
+                f"<h1>Sign-in failed</h1><p>{html.escape(error)}</p><p><a href='/'>Try again</a></p>"
+            )
 
         is_mcp = state in provider._pending
 
@@ -423,7 +778,9 @@ def create_app() -> Starlette:
         else:
             stored = request.session.pop("oauth_state", None)
             if state != stored:
-                return _page("<h1>Invalid request</h1><p>State mismatch.</p><p><a href='/'>Try again</a></p>")
+                return _page(
+                    "<h1>Invalid request</h1><p>State mismatch.</p><p><a href='/'>Try again</a></p>"
+                )
             callback_uri = request.session.pop("redirect_uri", None)
             code_verifier = request.session.pop("code_verifier", None)
 
@@ -434,19 +791,20 @@ def create_app() -> Starlette:
             flow.fetch_token(code=code)
         except Exception as exc:
             logger.exception("fetch_token failed")
-            return _page(f"<h1>Sign-in failed</h1><pre>{html.escape(str(exc))}</pre><p><a href='/'>Try again</a></p>")
+            return _page(
+                f"<h1>Sign-in failed</h1><pre>{html.escape(str(exc))}</pre><p><a href='/'>Try again</a></p>"
+            )
 
         creds = flow.credentials
         user_email = await _fetch_email(creds.token)
 
-        creds_data = {
-            "token": creds.token,
-            "refresh_token": creds.refresh_token,
-            "token_uri": creds.token_uri,
-            "client_id": creds.client_id,
-            "client_secret": creds.client_secret,
-            "scopes": list(creds.scopes) if creds.scopes else _SCOPES,
-        }
+        if not creds.refresh_token:
+            logger.warning(
+                "Google returned no refresh token for %s; the connection will "
+                "only last until the Google access token expires (~1h)",
+                user_email,
+            )
+        creds_data = _creds_to_store(creds)
 
         if is_mcp:
             params: AuthorizationParams = pending["params"]
@@ -475,14 +833,7 @@ def create_app() -> Starlette:
                 status_code=302,
             )
         else:
-            bearer = secrets.token_urlsafe(32)
-            provider._tokens[bearer] = {
-                "credentials": creds_data,
-                "email": user_email,
-                "client_id": "browser",
-                "scopes": _SCOPES,
-                "expires_at": int(time.time()) + 86400,
-            }
+            bearer = provider.browser_session_token(creds_data, user_email)
             request.session["user_email"] = user_email
             request.session["bearer_token"] = bearer
             return RedirectResponse("/", status_code=302)
@@ -496,7 +847,9 @@ def create_app() -> Starlette:
         uri = f"{base}/auth/callback"
         flow = _make_flow(uri)
         auth_url, state = flow.authorization_url(
-            access_type="offline", include_granted_scopes="true", prompt="consent"
+            access_type="offline",
+            include_granted_scopes="true",
+            prompt="consent",
         )
         request.session["oauth_state"] = state
         request.session["redirect_uri"] = uri
@@ -505,7 +858,6 @@ def create_app() -> Starlette:
         return RedirectResponse(auth_url)
 
     async def auth_logout(request: Request) -> Response:
-        provider._tokens.pop(request.session.get("bearer_token", ""), None)
         request.session.clear()
         return RedirectResponse("/")
 
@@ -521,7 +873,11 @@ def create_app() -> Starlette:
         email = request.session.get("user_email")
         body = (
             f"<h1>Google Analytics MCP Server</h1>"
-            + (f"<p>Signed in as <strong>{html.escape(email)}</strong></p>" if email else "")
+            + (
+                f"<p>Signed in as <strong>{html.escape(email)}</strong></p>"
+                if email
+                else ""
+            )
             + f'<span class="label">Add this URL to Claude.ai as a remote MCP server:</span>'
             + f"<pre>{html.escape(base)}/mcp</pre>"
             + "<p>Claude.ai will open a sign-in popup automatically.</p>"
@@ -542,49 +898,52 @@ def create_app() -> Starlette:
     # ------------------------------------------------------------------
 
     class _MCPAuthApp:
-        async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        async def __call__(
+            self, scope: Scope, receive: Receive, send: Send
+        ) -> None:
             if scope["type"] != "http":
                 return
 
             headers = dict(scope.get("headers", []))
-            session_id = headers.get(b"mcp-session-id")
+            token: str | None = None
 
-            if not session_id:
-                # New session — validate Bearer token first.
-                token: str | None = None
+            auth = headers.get(b"authorization", b"").decode()
+            if auth.startswith("Bearer "):
+                token = auth[7:]
 
-                auth = headers.get(b"authorization", b"").decode()
-                if auth.startswith("Bearer "):
-                    token = auth[7:]
+            if not token:
+                from urllib.parse import parse_qs
 
-                if not token:
-                    from urllib.parse import parse_qs
-                    qs = scope.get("query_string", b"").decode()
-                    token = (parse_qs(qs).get("token") or [None])[0]
+                qs = scope.get("query_string", b"").decode()
+                token = (parse_qs(qs).get("token") or [None])[0]
 
-                # Validate via provider (checks existence and expiry).
-                access_token_obj = None
-                if token:
-                    access_token_obj = await provider.load_access_token(token)
+            # Every request is authenticated (sessions are stateless).
+            payload = provider.decode_access_token(token) if token else None
+            if not payload:
+                logger.warning(
+                    "MCP /mcp: 401 — token=%s valid=%s",
+                    bool(token),
+                    bool(payload),
+                )
+                resp = Response(
+                    status_code=401,
+                    headers={
+                        "WWW-Authenticate": (
+                            f'Bearer realm="{_SCOPE_FINGERPRINT}"'
+                        )
+                    },
+                )
+                await resp(scope, receive, send)
+                return
 
-                if not access_token_obj or not token or token not in provider._tokens:
-                    logger.warning("MCP /mcp: 401 — token=%s valid=%s", bool(token), bool(access_token_obj))
-                    resp = Response(
-                        status_code=401,
-                        headers={"WWW-Authenticate": f'Bearer realm="{_SCOPE_FINGERPRINT}"'},
-                    )
-                    await resp(scope, receive, send)
-                    return
-
-                creds = _creds_from_store(provider._tokens[token]["credentials"])
-                ctx_token = _credentials_ctx.set(creds)
-                try:
-                    await session_manager.handle_request(scope, receive, send)
-                finally:
-                    _credentials_ctx.reset(ctx_token)
-            else:
-                # Existing session — credentials live in the spawned server task.
+            creds = _creds_from_store(payload["credentials"])
+            _apply_cached_google_token(creds)
+            ctx_token = _credentials_ctx.set(creds)
+            try:
                 await session_manager.handle_request(scope, receive, send)
+            finally:
+                _credentials_ctx.reset(ctx_token)
+                _remember_google_token(creds)
 
     # ------------------------------------------------------------------
     # Assemble Starlette app
@@ -592,10 +951,16 @@ def create_app() -> Starlette:
 
     routes = [
         # These MUST come before auth_routes to shadow the SDK's built-in handlers.
-        Route("/.well-known/oauth-authorization-server", oauth_server_metadata, methods=["GET"]),
+        Route(
+            "/.well-known/oauth-authorization-server",
+            oauth_server_metadata,
+            methods=["GET"],
+        ),
         Route("/register", register_client, methods=["POST"]),
         *auth_routes,  # /authorize, /token (/.well-known/oauth-authorization-server and /register shadowed above)
-        Route("/.well-known/oauth-protected-resource", protected_resource_metadata),
+        Route(
+            "/.well-known/oauth-protected-resource", protected_resource_metadata
+        ),
         Route("/auth/callback", auth_callback),
         Route("/auth/google", auth_google),
         Route("/auth/logout", auth_logout),
@@ -621,6 +986,7 @@ def create_app() -> Starlette:
         ],
         lifespan=lifespan,
     )
+    app.state.provider = provider
     return app
 
 
@@ -628,7 +994,9 @@ def create_app() -> Starlette:
 # Entry point
 # ---------------------------------------------------------------------------
 
+
 def run_web_server() -> None:
     import uvicorn
+
     port = int(os.environ.get("PORT", 8080))
     uvicorn.run(create_app(), host="0.0.0.0", port=port, log_level="info")
